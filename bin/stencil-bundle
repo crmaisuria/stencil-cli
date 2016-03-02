@@ -1,0 +1,414 @@
+#!/usr/bin/env node
+
+require('colors');
+
+var MAX_SIZE_COMPOSED = 1048576 * 2; //2MB
+var MAX_SIZE_MOBILE = 1048576; //1MB
+var MAX_SIZE_DESKTOP = 1048576 * 5; //5MB
+var MAX_SIZE_BUNDLE = 1048576 * 50; //50MB
+var WIDTH_COMPOSED = 600;
+var HEIGHT_COMPOSED = 760;
+var WIDTH_MOBILE = 304;
+var HEIGHT_MOBILE = 540;
+var WIDTH_DESKTOP = 2048;
+var HEIGHT_DESKTOP = 2600;
+var VALID_IMAGE_TYPES = ['.jpg', '.jpeg', '.png', '.gif'];
+
+var _ = require('lodash');
+var Archiver = require('archiver');
+var Async = require('async');
+var Crypto = require('crypto');
+var Fs = require('fs');
+var Jspm = require('jspm');
+var Path = require('path');
+var Program = require('commander');
+var CssAssembler = require('../lib/cssAssembler');
+var LangAssembler = require('../lib/langAssembler');
+var TemplateAssembler = require('../lib/templateAssembler');
+var ThemeConfig = require('../lib/themeConfig');
+var Tmp = require('tmp');
+var pkg = require('../package.json');
+var lwip = require('lwip');
+var themePath = process.cwd();
+var imagePath;
+var imageTasks = [];
+var tasks = {};
+var templatesBasePath = Path.join(themePath, 'templates');
+var themeConfig;
+var configuration;
+var validation;
+
+Program
+    .version(pkg.version)
+    .option('-d, --dest [dest]', 'Where to save the zip file. It defaults to the current directory you are in when bundling')
+    .option('-n, --name  [filename]', 'What do you want to call the zip file. It defaults to stencil-bundle.zip')
+    .parse(process.argv);
+
+themeConfig = ThemeConfig.getInstance(themePath);
+
+if (Program.dest === true) {
+    return console.error('Error: You have to specify a value for -d or --dest'.red);
+}
+
+if (Program.name === true) {
+    return console.error('Error: You have to specify a value for -n or --name'.red);
+}
+
+if (! themeConfig.configExists()) {
+    return console.error('Error: You must have a '.red + 'config.json'.cyan + ' file in your top level theme directory.');
+}
+
+configuration = themeConfig.getConfig();
+
+if (!themeConfig.globalSettings) {
+    return console.error('Error: Your config.json is missing \'settings\' (object).'.red);
+}
+
+tasks.css = getCssAssembleTask(configuration.css_compiler);
+tasks.templates = assembleTemplatesTask;
+tasks.lang = assembleLangTask;
+tasks.schema = assembleSchema;
+
+console.log("Validating theme...");
+
+if (configuration.jspm) {
+    if (! fileExists(Path.join(themePath, configuration.jspm.jspm_packages_path))) {
+        console.log('Error: The path you specified for your "jspm_packages" folder does not exist.'.red);
+        return console.log(
+            'Please check your '.red +
+            'jspm.jspm_packages_path'.cyan +
+            ' setting in your theme\'s '.red +
+            'config.json'.cyan +
+            ' file to make sure it\'s correct.'.red
+        );
+    }
+
+    configuration.jspm.tmpBundleFile = Tmp.fileSync().name;
+    tasks.jspmBundle = getJspmBundleTask(configuration.jspm);
+}
+
+if (! themeConfig.schemaExists()) {
+    console.log('Warning: Your theme is missing a \'schema.json\' file.'.orange);
+}
+
+// Validate against the theme registry config schema
+validation = themeConfig.validateConfigSchema();
+if (validation.length > 0) {
+    console.error('Your theme\'s config.json has errors:'.red);
+    validation.forEach(function(error ,index) {
+        console.error(error.stack.red);
+    });
+
+    return;
+}
+
+// Do a bit of validation on the images
+imagePath = Path.resolve(themePath, 'meta', configuration.meta.composed_image);
+
+if (!isValidImageType(imagePath)) {
+    return console.error('Error: Invalid file type for "meta.composed_image".'.red
+        + '\r\nValid types ('.red + VALID_IMAGE_TYPES.join(', ').red + ')'.red);
+} else if (! Fs.existsSync(imagePath)) {
+    return console.error('Error: The path you specified for your "meta.composed_image" does not exist.'.red);
+} else {
+    (function (path) {
+        imageTasks.push(function (cb) {
+            validateImage(path, 600, 760, cb);
+        });
+    }(imagePath));
+}
+
+for (var i = 0; i < configuration.variations.length; i++) {
+    var variation = configuration.variations[i];
+    var id = variation.id.blue;
+    imagePath = Path.resolve(themePath, 'meta', variation.meta.desktop_screenshot);
+    if (!isValidImageType(imagePath)) {
+        return console.error('Error: Invalid file type for '.red + id
+            + ' variation\'s "desktop_screenshot".'.red
+            + '\r\nValid types ('.red + VALID_IMAGE_TYPES.join(', ').red + ')'.red);
+    } else if (! Fs.existsSync(imagePath)) {
+        return console.error('Error: The path you specified for the '.red + id + ' variation\'s "desktop_screenshot" does not exist.'.red);
+    } else {
+        (function (path) {
+            imageTasks.push(function (cb) {
+                validateImage(path, 2048, 2600, cb);
+            });
+        }(imagePath));
+    }
+
+    imagePath = Path.resolve(themePath, 'meta', variation.meta.mobile_screenshot);
+
+    if (!isValidImageType(imagePath)) {
+        return console.error('Error: Invalid file type for '.red + id
+            + ' variation\'s "mobile_screenshot".'.red
+            + '\r\nValid types ('.red + VALID_IMAGE_TYPES.join(', ').red + ')'.red);
+    } else if (! Fs.existsSync(imagePath)) {
+        return console.error('Error: The path you specified for the '.red + id + ' variation\'s "mobile_screenshot" does not exist.'.red);
+    } else {
+        (function (path) {
+            imageTasks.push(function (cb) {
+                validateImage(path, 304, 540, cb);
+            });
+        }(imagePath));
+    }
+}
+
+// First validate images, then we are good to process the bundle afterwards
+Async.series([
+    function(cb) {
+        // Validate in parallel
+        Async.parallel(imageTasks, function(err, result) {
+            cb(err, result);
+        });
+    },
+    function(cb) {
+        Async.parallel(tasks, function (err, assembledData) {
+            var outputFolder = Program.dest ? Program.dest : themePath,
+                defaultName = themeConfig.getName() + '-' + themeConfig.getVersion() + '.zip',
+                outputName = Program.filename ? Program.filename : defaultName,
+                output = Fs.createWriteStream(Path.join(outputFolder, outputName)),
+                pathsToZip = [
+                    'assets/**/*',
+                    'meta/**/*',
+                    '!assets/jspm_packages/**', // Don't want jspm_packages if it's there
+                    'templates/**/*',
+                    'lang/*',
+                    'README.md',
+                    'CHANGELOG.md',
+                    'config.json',
+                    'package.json',
+                ],
+                archive = Archiver('zip');
+
+            if (err) {
+                return console.error(err);
+            }
+
+            output.on('close', function () {
+                console.log('ok'.green + ' -- Zipping Files Finished');
+                console.log('Bundled saved to: ' + Path.join(outputFolder, outputName).cyan);
+
+                var stats = Fs.statSync(Path.join(outputFolder, outputName));
+                var size = stats['size'];
+
+                if (size > MAX_SIZE_BUNDLE) {
+                    return console.error('Error: Your bundle of size' + size
+                        + 'bytes is above the max size of ' + MAX_SIZE_BUNDLE + 'bytes');
+                }
+            });
+
+            archive.pipe(output);
+
+            if (configuration.jspm) {
+                archive.append(
+                    Fs.createReadStream(configuration.jspm.tmpBundleFile),
+                    {name: configuration.jspm.bundle_location}
+                );
+            }
+
+            archive.bulk({
+                src: pathsToZip,
+                cwd: themePath,
+                expand: true
+            });
+
+            Async.forEachOf(assembledData, function (data, type, callback) {
+
+                if (type === 'css' || type === 'templates') {
+                    // Create the parsed tree files
+                    Async.forEachOf(data, function (val, filename, forEachOfCallback) {
+                        if (type === 'templates') {
+                            filename = Crypto.createHash('md5').update(filename).digest('hex');
+                            filename = Path.join('parsed', 'templates', filename + '.json');
+                        } else {
+                            filename = Path.join('parsed', 'scss', filename + '.json');
+                        }
+                        archive.append(JSON.stringify(val), {name: filename});
+                        forEachOfCallback();
+                    }, callback);
+
+                    return;
+
+                } else if (type === 'lang') {
+                    // append the parsed translation file with all translations
+                    archive.append(JSON.stringify(data), {name: 'parsed/lang.json'});
+                } else if (type === 'schema') {
+                    // append the generated schema.json file
+                    archive.append(JSON.stringify(data), {name: 'schema.json'});
+                }
+
+                callback();
+
+            }, function (err) {
+                if (err) {
+                    cb(err);
+                }
+
+                archive.finalize();
+                cb(null, true);
+            });
+        });
+    }
+], function(err , result) {
+    if (err) {
+        return console.error(err.message.red);
+    }
+});
+
+function isValidImageType(imagePath) {
+    var ext = Path.extname(imagePath);
+    return _.includes(VALID_IMAGE_TYPES, ext);
+}
+
+function validateImage(path, width, height, cb) {
+    lwip.open(path, function(err, image) {
+        if (err) {
+            return cb(err);
+        }
+
+        var imageWidth = image.width();
+        var imageHeight = image.height();
+        var failureMessage = '';
+
+        var stats = Fs.statSync(path);
+        var size = stats['size'];
+
+        if (width === WIDTH_DESKTOP && height === HEIGHT_DESKTOP && size > MAX_SIZE_DESKTOP) {
+            failureMessage = 'Error: Image of size ' + size + ' bytes at path (' + path + ') '
+            +  'is greater than allowed size ' + MAX_SIZE_DESKTOP + '\n';
+        } else if (width === WIDTH_COMPOSED && height === HEIGHT_COMPOSED && size > MAX_SIZE_COMPOSED) {
+            failureMessage = 'Error: Image of size ' + size + ' bytes at path (' + path + ') '
+            +  'is greater than allowed size ' + MAX_SIZE_COMPOSED + '\n';
+        } else if (width === WIDTH_MOBILE && height === HEIGHT_MOBILE && size > MAX_SIZE_MOBILE) {
+            failureMessage = 'Error: Image of size ' + size + ' bytes at path (' + path + ') '
+            +  'is greater than allowed size ' + MAX_SIZE_MOBILE + '\n';
+        }
+
+        if (imageWidth !== width || imageHeight != height) {
+            failureMessage += 'Error: Image at (' + path + ') has incorrect dimensions ('
+                + imageWidth + 'x' + imageHeight + ') should be' + '(' + width + 'x' + height + ')';
+            return cb(new Error(failureMessage));
+        }
+
+        cb(null, true);
+    });
+}
+
+function getCssAssembleTask(compiler) {
+    return function (callback) {
+        var basePath = Path.join(themePath, 'assets', compiler);
+
+        console.log('%s Parsing Started...', compiler.toUpperCase());
+        Fs.readdir(basePath, function (err, files) {
+            files = files.filter(function (file) {
+                return file.substr(-(compiler.length + 1)) === '.' + compiler;
+            });
+
+            Async.map(files, function (file, mapCallback) {
+                CssAssembler.assemble(file, basePath, compiler, mapCallback);
+            }, function (err, results) {
+                var ret = {};
+
+                if (err) {
+                    return callback(err);
+                }
+
+                _.each(files, function (file, index) {
+                    ret[file] = results[index];
+                });
+
+                console.log('ok'.green + ' -- %s Parsing Finished', compiler.toUpperCase());
+                callback(null, ret);
+            });
+        });
+    }
+}
+
+function assembleTemplatesTask(callback) {
+    console.log('Template Parsing Started...');
+
+    // https://github.com/bigcommerce-stencil/stencil-cli/pull/1
+    require('recursive-readdir')(templatesBasePath, ['!*.html'], function (err, files) {
+        files = files.map(function(file) {
+            return file.replace(templatesBasePath + Path.sep, '').replace('.html', '');
+        });
+
+        Async.map(files, TemplateAssembler.assemble, function (err, results) {
+            var ret = {};
+
+            if (err) {
+                return callback(err);
+            }
+
+            _.each(files, function (file, index) {
+                ret[file] = results[index];
+            });
+
+            console.log('ok'.green + ' -- Template Parsing Finished');
+            callback(null, ret);
+        });
+    });
+}
+
+function assembleSchema(callback) {
+    console.log('Building Theme Schema File...');
+
+    themeConfig.getSchema(function(err, schema) {
+        console.log('ok'.green + ' -- Theme Schema Building Finished');
+
+        callback(err, schema);
+    });
+}
+
+function assembleLangTask(callback) {
+    console.log('Language Files Parsing Started...');
+    LangAssembler.assemble(function (err, results) {
+        if (err) {
+            return callback(err);
+        }
+
+        console.log('ok'.green + ' -- Language Files Parsing Finished');
+        callback(null, results);
+    });
+}
+
+function getJspmBundleTask(jspmConfig) {
+    return function (callback) {
+        var oldConsoleError = console.error;
+
+        console.log('JavaScript Bundling Started...');
+
+        // Need to suppress annoying errors from Babel.
+        // They will be gone in the next minor version of JSPM (0.16.0).
+        // Until then, this will stay in place
+        console.error = function (error) {
+            if (!/Deprecated option metadataUsedHelpers/.test(error)) {
+                oldConsoleError(error);
+            }
+        };
+
+        Jspm.setPackagePath(themePath);
+        Jspm.bundleSFX(jspmConfig.bootstrap, jspmConfig.tmpBundleFile, {
+            minify: true,
+            mangle: true
+        }).then(function () {
+            console.log('ok'.green + ' -- JavaScript Bundling Finished');
+            console.error = oldConsoleError;
+            callback(null, true);
+        });
+    }
+}
+
+/**
+ * Check if file exist syncronous
+ * @param  {string} path
+ * @return {boolean}
+ */
+function fileExists(path) {
+    try {
+        return !!Fs.statSync(path);
+    }
+    catch (e) {
+        return false;
+    }
+}

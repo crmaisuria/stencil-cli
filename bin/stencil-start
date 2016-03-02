@@ -1,0 +1,350 @@
+#!/usr/bin/env node
+
+var _ = require('lodash');
+var Bs = require('browser-sync').create();
+var Fs = require('fs');
+var JspmAssembler = require('../lib/jspmAssembler');
+var Path = require('path');
+var Pkg = require('../package.json');
+var Program = require('commander');
+var Server = require('../server');
+var ThemeConfig = require('../lib/themeConfig');
+var stencilToken = require('../server/lib/stencilToken');
+var Url = require('url');
+var Wreck = require('wreck');
+var jsonLint = require('./../lib/jsonLint');
+var themePath = process.cwd();
+var allowedCssCompilers = ['scss', 'less'];
+var browserSyncPort;
+var cssCompilerDir;
+var cssWatchBaseDir = Path.join(themePath, 'assets/');
+var dotStencilFilePath = Path.join(themePath, '.stencil');
+var themeConfigPath = Path.join(themePath, 'config.json');
+var dotStencilFile;
+var isTopLevelCssRegex;
+var stencilServerPort;
+var themeConfig;
+var configuration;
+var staplerUrl;
+var headers;
+
+require('colors');
+
+Program
+    .version(Pkg.version)
+    .option('-o, --open', 'Automatically open default browser')
+    .option('-v, --variation [name]', 'Set which theme variation to use while developing')
+    .option('-t, --test', 'Enable QA mode which will bundle all javascript for speed to test locally')
+    .option('--tunnel', 'Create a tunnel URL which points to your local server that anyone can use.')
+    .option('-e, --theme-editor', 'Run Theme Editor server')
+    .option('-n, --no-cache', 'Turns off caching for API resource data per storefront page. The cache lasts for 5 minutes before automatically refreshing.')
+    .option('--theme-editor-port [port]', 'Run the Theme Editor on a different port')
+    .parse(process.argv);
+
+if (!fileExist(dotStencilFilePath)) {
+    return console.error('Error: Please run'.red + ' $ stencil init'.cyan + ' first.'.red);
+}
+
+if (!fileExist(Path.join(themePath, 'config.json'))) {
+    return console.error('Error: You must have a '.red + 'config.json'.cyan + ' file in your top level theme directory.');
+}
+
+// If the value is true it means that no variation was passed in.
+if (Program.variation === true) {
+    return console.error('Error: You have to specify a value for -v or --variation'.red);
+}
+
+// Instantiate themeConfig
+themeConfig = ThemeConfig.getInstance(themePath);
+
+if (Program.variation) {
+    try {
+        themeConfig.setVariationByName(Program.variation);
+    } catch (err) {
+        return console.error('Error: The variation '.red + Program.variation + ' does not exists in your config.json file'.red);
+    }
+}
+
+configuration = themeConfig.getConfig();
+
+dotStencilFile = Fs.readFileSync(dotStencilFilePath, {encoding: 'utf-8'});
+
+try {
+    dotStencilFile = jsonLint.parse(dotStencilFile, dotStencilFilePath);
+} catch (e) {
+    return console.error(e.stack);
+}
+
+if (allowedCssCompilers.indexOf(configuration.css_compiler) === -1) {
+    return console.error('Error: Only %s are allowed as CSS Compilers'.red, allowedCssCompilers.join(', '));
+}
+
+browserSyncPort = dotStencilFile.port;
+stencilServerPort = ++dotStencilFile.port;
+cssCompilerDir = cssWatchBaseDir + configuration.css_compiler;
+isTopLevelCssRegex = new RegExp('^(?!_).+\.(?:' + configuration.css_compiler + ')$');
+
+if (!(dotStencilFile.normalStoreUrl) || !(dotStencilFile.customLayouts)) {
+    return console.error(
+        'Error: Your stencil config is outdated. Please run'.red +
+        ' $ stencil init'.cyan + ' again.'.red
+    );
+}
+
+headers = {
+    'stencil-cli': Pkg.version
+};
+
+if (dotStencilFile.staplerUrl) {
+    staplerUrl = dotStencilFile.staplerUrl;
+    headers['stencil-store-url'] = dotStencilFile.normalStoreUrl;
+} else {
+    staplerUrl = dotStencilFile.normalStoreUrl;
+}
+
+Wreck.get(
+    Url.resolve(staplerUrl, '/stencil-version-check?v=' + Pkg.version),
+    {
+        headers: headers
+    },
+    function(err, res, payload) {
+        var retError = err !== null,
+            bundleTask;
+
+        try {
+            payload = jsonLint.parse(payload);
+
+            if (payload.error) {
+                return console.error(payload.error.red);
+            }
+        } catch (e) {
+            retError = true;
+        }
+
+        if (retError) {
+            console.error(
+                'The Bigcommerce Store you are pointing to either does not exist or is not available at this time.'.red
+            );
+        } else if (payload.status !== 'ok') {
+            console.error(
+                'Error: You are using an outdated version of stencil-cli, please run '.red +
+                '$ npm install -g bigcommerce-stencil/stencil-cli'.cyan
+            );
+        } else {
+            stencilToken.getAuth({
+                username: dotStencilFile.username,
+                token: dotStencilFile.token,
+                host: payload.sslUrl
+            }, function(err, response) {
+                if (response.authorized) {
+                    dotStencilFile.storeUrl = payload.sslUrl;
+                    dotStencilFile.normalStoreUrl = payload.baseUrl;
+                    dotStencilFile.stencilServerPort = stencilServerPort;
+
+                    if (configuration.jspm && Program.test) {
+                        bundleTask = JspmAssembler.assemble(
+                            {
+                                bootstrap: configuration.jspm.bootstrap
+                            },
+                            themePath
+                        );
+
+                        bundleTask(function(result) {
+                            return startServer();
+                        });
+                    } else {
+                        return startServer();
+                    }
+                } else {
+                    return console.error('Unauthorized, please use a valid username/token'.red);
+                }
+            })
+        }
+    }
+);
+
+/**
+ * Starts up the local Stencil Server as well as starts up BrowserSync and sets some watch options.
+ */
+function startServer() {
+    var params = {
+        dotStencilFile: dotStencilFile,
+        variationIndex: themeConfig.variationIndex || 0,
+        stencilEditorEnabled: Program.themeEditor,
+        stencilEditorPort: Program.themeEditorPort || 8181,
+        useCache: Program.cache
+    };
+
+    Server(params, function(err) {
+        if (err) {
+            throw err;
+        }
+
+        // Display Set up information
+        console.log(startUpInformation());
+
+        /**
+         * Watch the appropriate css directory based on which compiler was chosen.
+         * This will run on each file (and files in sub-directories) when the server starts
+         * up. We only want to run compilation on top level files as the ones in sub directories
+         * are most likely include files and will be pulled in by the top level files.
+         *
+         * When a file in a sub directory changes, we have to recompile all top level files because
+         * more than one could have included the changed file.
+         */
+        Bs.watch(cssCompilerDir, function(event, file) {
+            var relativePath,
+                changedFile,
+                basename;
+
+            if (event === 'add' || event === 'change') {
+                relativePath = Path.relative(cssCompilerDir, file);
+                // Only run it through if it's a top level file
+                if (
+                    ! relativePath.match(/\//) && isTopLevelCssRegex.test(relativePath)
+                ) {
+                    basename = Path.basename(file, '.' + configuration.css_compiler);
+                    changedFile = Path.join(process.cwd(), 'assets/css', basename + '.css');
+                    Bs.reload(changedFile);
+                // Only reload top level files if this is a change event and it's in a sub directory
+                } else if (event === 'change') {
+                    reloadTopLevelCss(cssCompilerDir);
+                }
+            }
+        });
+
+        Bs.watch('config.json', function(event) {
+            if (event === 'change') {
+                try {
+                    configuration = themeConfig.getConfig();
+                } catch (e) {
+                    return console.error(e);
+                }
+
+                Bs.reload();
+            }
+        });
+
+        Bs.init({
+            open: !! Program.open,
+            port: browserSyncPort,
+            files: [
+                '/assets',
+                '/templates',
+                '/lang'
+            ].map(function(val) {
+                return Path.join(themePath, val);
+            }),
+            watchOptions: {
+                ignoreInitial: true,
+                ignored: [
+                    '/assets/scss',
+                    '/assets/less',
+                    '/assets/css',
+                    '/assets/jspm_packages'
+                ].map(function(val) {
+                    return Path.join(themePath, val);
+                })
+            },
+            proxy: "localhost:" + stencilServerPort,
+            tunnel: !! Program.tunnel
+        });
+
+        // Handle manual reloading of browsers by typing 'rs';
+        // Borrowed from https://github.com/remy/nodemon
+        process.stdin.resume();
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', function (data) {
+            data = (data + '').trim().toLowerCase();
+
+            // if the keys entered match the restartable value, then restart!
+            if (data === 'rs') {
+                Bs.reload();
+            }
+        });
+    });
+}
+
+/**
+ * Convenience function to parse Theme Config and set some default values if they aren't present
+ *
+ * @return object
+ */
+function parseThemeConfig() {
+    var ret = {},
+        themeConfig;
+
+    themeConfig = ThemeConfig.getInstance(themePath, Program.variation);
+
+    try {
+        ret.config = themeConfig.getConfig();
+    } catch (e) {
+        return console.error(e);
+    }
+
+    return ret;
+}
+
+/**
+ * Reloads all top level scss/less files that aren't prefixed with an underscore.
+ *
+ * @param cssCompilerDir
+ */
+function reloadTopLevelCss(cssCompilerDir) {
+    var changedFile,
+        basename;
+
+    Fs.readdir(cssCompilerDir, function (err, files) {
+        if (err) {
+            return console.error(err);
+        }
+
+        files.filter(function (file) {
+            return isTopLevelCssRegex.test(file);
+        }).forEach(function (file) {
+            basename = Path.basename(file, '.' + configuration.css_compiler);
+            changedFile = Path.join(process.cwd(), 'assets/css', basename + '.css');
+
+            Bs.reload(changedFile);
+        });
+    });
+}
+
+/**
+ * Check if file exist syncronous
+ * @param  {string} path
+ * @return {boolean}
+ */
+function fileExist(path) {
+    try {
+        return !!Fs.statSync(path);
+    }
+    catch (e) {
+        return false;
+    }
+}
+
+/**
+* Displays information about your environment and configuration.
+* @return {string}
+*/
+function startUpInformation() {
+    var information = '\n';
+
+    information += '-----------------Startup Information-------------\n'.gray;
+    information += '\n';
+    information += '.stencil location: ' + dotStencilFilePath.cyan + '\n';
+    information += 'config.json location: ' + themeConfigPath.cyan + '\n';
+    information += 'Store URL: ' + dotStencilFile.normalStoreUrl.cyan + '\n';
+
+    if (dotStencilFile.staplerUrl) {
+        information += 'Stapler URL: ' + staplerUrl.cyan + '\n';
+    }
+
+    information += 'SSL Store URL: ' + dotStencilFile.storeUrl.cyan + '\n';
+    information += 'Node Version: ' + process.version.cyan + '\n';
+    information += '\n';
+    information += '-------------------------------------------------\n'.gray;
+
+    return information;
+}
